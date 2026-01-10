@@ -3,20 +3,23 @@ import io
 import httpx
 import requests
 import trafilatura
+import json
 from fastapi import FastAPI, Depends, HTTPException, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
 from pydantic import BaseModel 
 from pypdf import PdfReader
-import json
 
+# Local imports for Database configuration and ORM Models
 import models 
 from database import SessionLocal, engine, DRY_RUN_MODE
 
+# Create database tables if they don't exist yet
 models.Base.metadata.create_all(bind=engine)
 
 app = FastAPI(title="CareerFlow AI Gateway")
 
+# --- CORS CONFIGURATION ---
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:3000"],
@@ -25,13 +28,14 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# --- DATA MODELS ---
+# --- PYDANTIC MODELS ---
 class JobCreate(BaseModel):
     company: str
     title: str
     url: str | None = None
     description: str | None = None
 
+# --- DATABASE DEPENDENCY ---
 def get_db():
     db = SessionLocal()
     try:
@@ -39,7 +43,7 @@ def get_db():
     finally:
         db.close()
 
-# --- SCRAPER LOGIC ---
+# --- UTILITY: WEB SCRAPER ---
 async def scrape_job_description(url: str) -> str:
     try:
         async with httpx.AsyncClient(timeout=10.0, follow_redirects=True) as client:
@@ -51,16 +55,25 @@ async def scrape_job_description(url: str) -> str:
 
 # --- ENDPOINTS ---
 
-@app.get("/jobs")
+@app.get("/api/dashboard/jobs")
 def get_all_jobs(db: Session = Depends(get_db)):
-    return db.query(models.Job).all()
+    """Retrieves all jobs for the main feed."""
+    return db.query(models.Job).order_by(models.Job.created_at.desc()).all()
 
 @app.post("/jobs")
 async def create_job(job_data: JobCreate, db: Session = Depends(get_db)):
+    """Creates a new job and scrapes the URL if description is missing."""
     desc = job_data.description
     if job_data.url and not desc:
         desc = await scrape_job_description(job_data.url)
-    new_job = models.Job(company=job_data.company, title=job_data.title, description=desc)
+        
+    new_job = models.Job(
+        company=job_data.company, 
+        title=job_data.title, 
+        url=job_data.url,
+        description=desc,
+        status="Manual"
+    )
     db.add(new_job)
     db.commit()
     db.refresh(new_job)
@@ -68,85 +81,72 @@ async def create_job(job_data: JobCreate, db: Session = Depends(get_db)):
 
 @app.delete("/jobs/{job_id}")
 def delete_job(job_id: int, db: Session = Depends(get_db)):
-    # 1. Find the job
     job = db.query(models.Job).filter(models.Job.id == job_id).first()
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
     
-    # 2. DELETE THE HISTORY FIRST (Crucial Fix)
-    # This removes the foreign key references so the DB is happy
     db.query(models.AnalysisResult).filter(models.AnalysisResult.job_id == job_id).delete()
-    
-    # 3. Now delete the job
     db.delete(job)
     db.commit()
-    return {"message": "Job and history deleted successfully"}
+    return {"message": "Job deleted"}
+
+# --- RESUME ENDPOINTS ---
 
 @app.get("/resumes")
 def get_resumes(db: Session = Depends(get_db)):
+    """NEW: Fetches all resumes so they show up in the frontend list."""
     return db.query(models.Resume).all()
 
 @app.post("/resumes/upload")
 async def upload_resume(name: str, file: UploadFile = File(...), db: Session = Depends(get_db)):
-    contents = await file.read()
-    reader = PdfReader(io.BytesIO(contents))
-    text = "".join([p.extract_text() for p in reader.pages])
-    new_resume = models.Resume(name=name, content=text)
-    db.add(new_resume)
-    db.commit()
-    return {"message": "Uploaded"}
+    """Accepts PDF, extracts text, and saves to DB."""
+    try:
+        contents = await file.read()
+        reader = PdfReader(io.BytesIO(contents))
+        text = "".join([p.extract_text() for p in reader.pages])
+        
+        new_resume = models.Resume(name=name, content=text)
+        db.add(new_resume)
+        db.commit()
+        db.refresh(new_resume)
+        return {"message": "Upload successful", "id": new_resume.id}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"PDF Processing Error: {str(e)}")
 
-@app.get("/results/{job_id}")
-def get_results(job_id: int, db: Session = Depends(get_db)):
-    # LOGIC: Returns history for the specific job card
-    return db.query(models.AnalysisResult)\
-             .filter(models.AnalysisResult.job_id == job_id)\
-             .order_by(models.AnalysisResult.id.asc())\
-             .all()
+# --- ANALYSIS ENDPOINTS ---
 
 @app.post("/jobs/{job_id}/analyze/{resume_id}")
 def analyze(job_id: int, resume_id: int, db: Session = Depends(get_db)):
     job = db.query(models.Job).filter(models.Job.id == job_id).first()
     resume = db.query(models.Resume).filter(models.Resume.id == resume_id).first()
     
-    
-    # NEW LOGIC: Injecting the "Expert Recruiter" instructions here
-    enhanced_instruction = (
-        "Analyze as an expert recruiter. Provide a score and a summary including: "
-        "Top 3 missing keywords, strongest match point, and one resume improvement tip."
-    )
+    if not job or not resume:
+        raise HTTPException(status_code=404, detail="Data not found")
 
     ai_url = "http://ai-engine:8000/analyze"
-    res = requests.post(ai_url, json={
-        "resume_text": resume.content,
-        "job_description": job.description,
-        "instruction": enhanced_instruction, # Passing the new 'Brain' logic
-        "mock": DRY_RUN_MODE
-    })
-    
-    ai_data = res.json()
+    try:
+        res = requests.post(ai_url, json={
+            "resume_text": resume.content,
+            "job_description": job.description or "No description available.",
+            "mock": DRY_RUN_MODE
+        }, timeout=30)
+        ai_data = res.json()
 
-
-    raw_summary = ai_data.get("summary", "")
-    
-    # If the AI sent back a dict (which it does now with our new prompt),
-    # we turn it into a readable string for the database.
-    if isinstance(raw_summary, dict):
-        formatted_summary = (
-            f"STRENGTH: {raw_summary.get('strongest_match_point', 'N/A')}\n\n"
-            f"GAPS: {', '.join(raw_summary.get('top_3_missing_keywords', []))}\n\n"
-            f"ACTION: {raw_summary.get('action_plan', 'N/A')}"
+        new_res = models.AnalysisResult(
+            job_id=job_id, 
+            match_score=ai_data.get("match_score", 0),
+            summary=json.dumps(ai_data.get("summary", "")) # Store as string
         )
-    else:
-        formatted_summary = str(raw_summary)
+        db.add(new_res)
+        db.commit()
+        
+        return {"ai_response": ai_data}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"AI Engine error: {str(e)}")
 
-    # SAVE TO HISTORY
-    new_res = models.AnalysisResult(
-        job_id=job_id, 
-        match_score=ai_data.get("match_score", 0),
-        summary=formatted_summary # Now it's a string!
-    )
-    db.add(new_res)
-    db.commit()
-    
-    return {"ai_response": ai_data}
+@app.get("/results/{job_id}")
+def get_results(job_id: int, db: Session = Depends(get_db)):
+    return db.query(models.AnalysisResult)\
+             .filter(models.AnalysisResult.job_id == job_id)\
+             .order_by(models.AnalysisResult.id.asc())\
+             .all()

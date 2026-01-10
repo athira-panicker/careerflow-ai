@@ -52,7 +52,24 @@ services:
     environment:
       - NEXT_PUBLIC_API_URL=http://localhost:8000
     depends_on:
-      - gateway    
+      - gateway
+
+  gmail-agent:
+    build:
+      context: ./services/agents         
+      # dockerfile: Dockerfile
+    # depends_on:
+    #   db:
+    #     condition: service_healthy
+    #   ai-engine:
+    #     condition: any
+    environment:
+      - DATABASE_URL=postgresql://postgres:password@db:5432/careerflow_db
+      - AI_ENGINE_URL=http://ai-engine:8000/process
+    volumes:
+      - ./services/agents/token.json:/app/token.json
+    networks:
+      - careerflow-network
 
 volumes:
   postgres_data:
