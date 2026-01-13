@@ -4,15 +4,18 @@ import httpx
 import requests
 import trafilatura
 import json
-from fastapi import FastAPI, Depends, HTTPException, UploadFile, File
+from typing import List  # <--- FIX: Added this for List[]
+from fastapi import FastAPI, Form, File, UploadFile, Depends, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
 from pydantic import BaseModel 
 from pypdf import PdfReader
-
-# Local imports for Database configuration and ORM Models
 import models 
-from database import SessionLocal, engine, DRY_RUN_MODE
+from database import SessionLocal, engine, DRY_RUN_MODE, get_db
+from datetime import datetime
+from pypdf import PdfReader
+from PyPDF2 import PdfReader
+from fastapi.staticfiles import StaticFiles
 
 # Create database tables if they don't exist yet
 models.Base.metadata.create_all(bind=engine)
@@ -22,7 +25,7 @@ app = FastAPI(title="CareerFlow AI Gateway")
 # --- CORS CONFIGURATION ---
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000"],
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -34,9 +37,26 @@ class JobCreate(BaseModel):
     title: str
     url: str | None = None
     description: str | None = None
+    gmail_id: str | None = None
+
+class TrackerCreate(BaseModel):
+    gmail_id: str
+    company: str
+    role: str
+    status: str
+    required_skills: str
+
+# Pydantic Schema for outgoing data
+class TrackerResponse(TrackerCreate):
+    id: int
+    applied_at: datetime
+
+    class Config:
+        from_attributes = True
 
 # --- DATABASE DEPENDENCY ---
-def get_db():
+# (Using the one imported from database.py or defined here)
+def get_db_session():
     db = SessionLocal()
     try:
         yield db
@@ -53,15 +73,15 @@ async def scrape_job_description(url: str) -> str:
     except Exception as e:
         return f"Scrape Error: {str(e)}"
 
-# --- ENDPOINTS ---
+# --- JOB ENDPOINTS ---
 
 @app.get("/api/dashboard/jobs")
-def get_all_jobs(db: Session = Depends(get_db)):
+def get_all_jobs(db: Session = Depends(get_db_session)):
     """Retrieves all jobs for the main feed."""
     return db.query(models.Job).order_by(models.Job.created_at.desc()).all()
 
 @app.post("/jobs")
-async def create_job(job_data: JobCreate, db: Session = Depends(get_db)):
+async def create_job(job_data: JobCreate, db: Session = Depends(get_db_session)):
     """Creates a new job and scrapes the URL if description is missing."""
     desc = job_data.description
     if job_data.url and not desc:
@@ -72,6 +92,7 @@ async def create_job(job_data: JobCreate, db: Session = Depends(get_db)):
         title=job_data.title, 
         url=job_data.url,
         description=desc,
+        gmail_id=job_data.gmail_id,
         status="Manual"
     )
     db.add(new_job)
@@ -80,7 +101,7 @@ async def create_job(job_data: JobCreate, db: Session = Depends(get_db)):
     return new_job
 
 @app.delete("/jobs/{job_id}")
-def delete_job(job_id: int, db: Session = Depends(get_db)):
+def delete_job(job_id: int, db: Session = Depends(get_db_session)):
     job = db.query(models.Job).filter(models.Job.id == job_id).first()
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
@@ -92,31 +113,75 @@ def delete_job(job_id: int, db: Session = Depends(get_db)):
 
 # --- RESUME ENDPOINTS ---
 
+# 1. Setup Storage
+UPLOAD_DIR = "uploads/resumes"
+os.makedirs(UPLOAD_DIR, exist_ok=True)
+
+# 2. Mount Static Files (Ensure this is only here once)
+app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
+
 @app.get("/resumes")
-def get_resumes(db: Session = Depends(get_db)):
-    """NEW: Fetches all resumes so they show up in the frontend list."""
+def get_resumes(db: Session = Depends(get_db_session)):
     return db.query(models.Resume).all()
 
+
 @app.post("/resumes/upload")
-async def upload_resume(name: str, file: UploadFile = File(...), db: Session = Depends(get_db)):
-    """Accepts PDF, extracts text, and saves to DB."""
+async def upload_resume(
+    name: str = Form(...), 
+    file: UploadFile = File(...), 
+    db: Session = Depends(get_db_session)
+):
     try:
-        contents = await file.read()
-        reader = PdfReader(io.BytesIO(contents))
-        text = "".join([p.extract_text() for p in reader.pages])
+        # 1. Define filenames and paths
+        safe_name = name.replace(" ", "_")
+        filename = f"{safe_name}_{file.filename}"
+        local_disk_path = os.path.join(UPLOAD_DIR, filename)
         
-        new_resume = models.Resume(name=name, content=text)
+        # 2. Save file to disk
+        file_content = await file.read()
+        with open(local_disk_path, "wb") as buffer:
+            buffer.write(file_content)
+        
+        # 3. Extract text for AI analysis
+        # (Using PdfReader requires 'import io' and 'from PyPDF2 import PdfReader')
+        from PyPDF2 import PdfReader
+        import io
+        
+        reader = PdfReader(io.BytesIO(file_content))
+        extracted_text = ""
+        for page in reader.pages:
+            extracted_text += page.extract_text() or ""
+
+        # 4. Store the STATIC URL path in DB
+        db_url = f"uploads/resumes/{filename}" 
+        
+        # 5. Create the Database Record
+        # IMPORTANT: 'file_url' here MUST match 'file_url' in models.py
+        new_resume = models.Resume(
+            name=name, 
+            content=extracted_text, 
+            file_url=db_url  
+        )
+        
         db.add(new_resume)
         db.commit()
         db.refresh(new_resume)
-        return {"message": "Upload successful", "id": new_resume.id}
+        
+        return {
+            "message": "Upload successful", 
+            "id": new_resume.id,
+            "filename": filename
+        }
+
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"PDF Processing Error: {str(e)}")
+        db.rollback() # Rollback if DB fails
+        print(f"ERROR: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Server Error: {str(e)}")
 
 # --- ANALYSIS ENDPOINTS ---
 
 @app.post("/jobs/{job_id}/analyze/{resume_id}")
-def analyze(job_id: int, resume_id: int, db: Session = Depends(get_db)):
+def analyze(job_id: int, resume_id: int, db: Session = Depends(get_db_session)):
     job = db.query(models.Job).filter(models.Job.id == job_id).first()
     resume = db.query(models.Resume).filter(models.Resume.id == resume_id).first()
     
@@ -135,7 +200,7 @@ def analyze(job_id: int, resume_id: int, db: Session = Depends(get_db)):
         new_res = models.AnalysisResult(
             job_id=job_id, 
             match_score=ai_data.get("match_score", 0),
-            summary=json.dumps(ai_data.get("summary", "")) # Store as string
+            summary=json.dumps(ai_data.get("summary", ""))
         )
         db.add(new_res)
         db.commit()
@@ -145,8 +210,35 @@ def analyze(job_id: int, resume_id: int, db: Session = Depends(get_db)):
         raise HTTPException(status_code=500, detail=f"AI Engine error: {str(e)}")
 
 @app.get("/results/{job_id}")
-def get_results(job_id: int, db: Session = Depends(get_db)):
+def get_results(job_id: int, db: Session = Depends(get_db_session)):
     return db.query(models.AnalysisResult)\
              .filter(models.AnalysisResult.job_id == job_id)\
              .order_by(models.AnalysisResult.id.asc())\
              .all()
+
+# --- TRACKER ENDPOINTS ---
+
+@app.get("/tracker/all", response_model=List[TrackerResponse])
+def get_all_applications(db: Session = Depends(get_db)):
+    """Fetches all tracked jobs from Gmail sync."""
+    return db.query(models.TrackerJob).order_by(models.TrackerJob.applied_at.desc()).all()
+
+@app.post("/tracker", response_model=TrackerResponse)
+def create_application(application: TrackerCreate, db: Session = Depends(get_db)):
+    """Creates a entry in the tracker table."""
+    db_app = db.query(models.TrackerJob).filter(
+        models.TrackerJob.gmail_id == application.gmail_id
+    ).first()
+    
+    if db_app:
+        return db_app
+        
+    new_app = models.TrackerJob(**application.model_dump())
+    db.add(new_app)
+    db.commit()
+    db.refresh(new_app)
+    return new_app
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)

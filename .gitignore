@@ -4,3 +4,4 @@ __pycache__/
 .docker/
 node_modules/
 services/agents/token.json
+services/agents/credentials.json

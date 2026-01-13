@@ -1,82 +1,98 @@
 import { useState, useEffect } from 'react';
+import Link from 'next/link';
 
 export default function Home() {
-  // --- 1. STATE MANAGEMENT ---
   const [jobs, setJobs] = useState([]);
   const [resumes, setResumes] = useState([]);
-  const [results, setResults] = useState({}); 
-  const [expandedJob, setExpandedJob] = useState(null);
-  
+  const [results, setResults] = useState({});
+  const [stats, setStats] = useState({ total: 0, today: 0 });
   const [jobForm, setJobForm] = useState({ company: '', title: '', url: '' });
   const [resumeName, setResumeName] = useState("");
   const [resumeFile, setResumeFile] = useState(null);
   const [selectedResumes, setSelectedResumes] = useState({});
   const [loadingId, setLoadingId] = useState(null);
+  const [isScraping, setIsScraping] = useState(false);
+  const [isUploading, setIsUploading] = useState(false);
 
   const API_URL = "http://localhost:8000";
 
-  // --- 2. DATA SYNCHRONIZATION ---
   const fetchData = async () => {
     try {
-      // Aligned with main.py endpoints
-      const [jobsRes, resumesRes] = await Promise.all([
+      const [jobsRes, resumesRes, trackerRes] = await Promise.all([
         fetch(`${API_URL}/api/dashboard/jobs`),
-        fetch(`${API_URL}/resumes`)
+        fetch(`${API_URL}/resumes`),
+        fetch(`${API_URL}/tracker/all`)
       ]);
 
       const jobsData = await jobsRes.json();
       const resumesData = await resumesRes.json();
+      const trackerData = await trackerRes.json();
 
       setJobs(Array.isArray(jobsData) ? jobsData : []);
       setResumes(Array.isArray(resumesData) ? resumesData : []);
 
-      // Load matching history for each job
+      if (Array.isArray(trackerData)) {
+        const todayStr = new Date().toISOString().split('T')[0];
+        const todayCount = trackerData.filter(j => 
+          new Date(j.applied_at).toISOString().split('T')[0] === todayStr
+        ).length;
+        setStats({ total: trackerData.length, today: todayCount });
+      }
+
+      // Fetch existing analysis results for jobs
       if (Array.isArray(jobsData)) {
         jobsData.forEach(async (job) => {
           try {
             const res = await fetch(`${API_URL}/results/${job.id}`);
             const history = await res.json();
             if (Array.isArray(history) && history.length > 0) {
-              // Store the most recent result for the dashboard
               setResults(prev => ({ ...prev, [job.id]: history[history.length - 1] }));
             }
-          } catch (e) { console.warn(`No history for job ${job.id}`); }
+          } catch (e) { console.warn(e); }
         });
       }
-    } catch (err) {
-      console.error("Connection to backend failed. Check if FastAPI is running on port 8000.");
-    }
+    } catch (err) { console.error("Backend offline."); }
   };
 
   useEffect(() => { fetchData(); }, []);
 
-  // --- 3. EVENT HANDLERS ---
+  // FIXED: Standard FormData upload to match backend Form(...) and File(...)
   const handleResumeUpload = async (e) => {
     e.preventDefault();
-    if (!resumeFile || !resumeName) return alert("Select a file and provide a label.");
-
+    if (!resumeFile || !resumeName) return alert("Please select a file and enter a label.");
+    
+    setIsUploading(true);
     const formData = new FormData();
+    formData.append("name", resumeName);
     formData.append("file", resumeFile);
 
     try {
-      // Matches your main.py: /resumes/upload?name=...
-      const res = await fetch(`${API_URL}/resumes/upload?name=${encodeURIComponent(resumeName)}`, {
-        method: 'POST',
-        body: formData,
+      const res = await fetch(`${API_URL}/resumes/upload`, {
+        method: 'POST', 
+        body: formData, // Browser sets multipart/form-data boundary automatically
       });
-
+      
       if (res.ok) {
-        setResumeName("");
-        setResumeFile(null);
-        e.target.reset(); // Clear file input
+        setResumeName(""); 
+        setResumeFile(null); 
+        e.target.reset();
+        alert("Resume added to Vault!");
         fetchData();
-        alert("Resume Uploaded!");
+      } else {
+        const err = await res.json();
+        alert(`Upload failed: ${err.detail}`);
       }
-    } catch (err) { alert("Upload failed."); }
+    } catch (err) { 
+      console.error(err); 
+      alert("Network error during upload.");
+    } finally {
+      setIsUploading(false);
+    }
   };
 
   const handleJobSubmit = async (e) => {
     e.preventDefault();
+    setIsScraping(true);
     try {
       await fetch(`${API_URL}/jobs`, {
         method: 'POST',
@@ -85,148 +101,206 @@ export default function Home() {
       });
       setJobForm({ company: '', title: '', url: '' });
       fetchData();
-    } catch (err) { alert("Job save failed."); }
+    } catch (err) { console.error(err); }
+    finally { setIsScraping(false); }
   };
 
   const handleAnalyze = async (jobId) => {
     const resumeId = selectedResumes[jobId];
-    if (!resumeId) return alert("Select a resume first!");
-    
+    if (!resumeId) return alert("Select a resume from your vault first!");
     setLoadingId(jobId);
     try {
       const res = await fetch(`${API_URL}/jobs/${jobId}/analyze/${resumeId}`, { method: 'POST' });
       const data = await res.json();
       setResults(prev => ({ ...prev, [jobId]: data.ai_response }));
-    } catch (err) { alert("AI Analysis failed."); } 
+    } catch (err) { console.error(err); } 
     finally { setLoadingId(null); }
   };
 
-  const handleDeleteJob = async (id) => {
-    if (!confirm("Delete this job?")) return;
-    await fetch(`${API_URL}/jobs/${id}`, { method: 'DELETE' });
-    fetchData();
-  };
-
-  // --- 4. RENDER ---
   return (
     <div style={styles.container}>
-      <header style={styles.header}>
-        <h1>🚀 CareerFlow AI</h1>
-        <p>Your AI-powered resume match dashboard.</p>
-      </header>
+      <nav style={styles.navbar}>
+        <div style={styles.navBrand}>🚀 CareerFlow<span style={{color: '#6366f1'}}>AI</span></div>
+        <div style={styles.navLinks}>
+          <Link href="/resumes" style={styles.navItem}>Resume Vault</Link>
+          <Link href="/tracker" style={styles.navItem}>Applications</Link>
+          <div style={styles.userCircle}>JD</div>
+        </div>
+      </nav>
 
-      <div style={styles.gridSplit}>
-        {/* RESUME VAULT */}
-        <section style={styles.section}>
-          <h3>📄 Resume Vault</h3>
-          <form onSubmit={handleResumeUpload} style={styles.form}>
-            <input 
-              style={styles.input} 
-              placeholder="Label (e.g. Software Eng v1)" 
-              value={resumeName} 
-              onChange={e => setResumeName(e.target.value)} 
-              required 
-            />
-            <input 
-              type="file" 
-              accept=".pdf" 
-              onChange={e => setResumeFile(e.target.files[0])} 
-              required 
-            />
-            <button type="submit" style={styles.btnPrimary}>Upload PDF</button>
-          </form>
-          <div style={styles.tagList}>
-            {resumes.map(r => (
-              <span key={r.id} style={styles.tag}>📎 {r.name}</span>
-            ))}
+      <div style={styles.contentWrapper}>
+        <div style={styles.heroSection}>
+          <div style={styles.heroText}>
+            <h1 style={styles.mainTitle}>Master Your <span style={styles.gradientText}>Job Search</span></h1>
+            <p style={styles.subtitle}>Upload your resumes once, analyze every job instantly.</p>
           </div>
-        </section>
-
-        {/* JOB ENTRY */}
-        <section style={styles.section}>
-          <h3>💼 Add New Job</h3>
-          <form onSubmit={handleJobSubmit} style={styles.form}>
-            <input style={styles.input} placeholder="Company" value={jobForm.company} onChange={e => setJobForm({...jobForm, company: e.target.value})} required />
-            <input style={styles.input} placeholder="Job Title" value={jobForm.title} onChange={e => setJobForm({...jobForm, title: e.target.value})} required />
-            <input style={styles.input} placeholder="Job URL" value={jobForm.url} onChange={e => setJobForm({...jobForm, url: e.target.value})} />
-            <button type="submit" style={styles.btnSecondary}>Add Job</button>
-          </form>
-        </section>
-      </div>
-
-      <hr style={styles.divider} />
-
-      {/* JOB LISTINGS FEED */}
-      <div style={styles.feed}>
-        {jobs.length === 0 && <p style={{textAlign: 'center', color: '#999'}}>No jobs tracked yet. Add one above!</p>}
-        {jobs.map(job => (
-          <div key={job.id} style={styles.card}>
-            <div style={styles.cardHeader}>
-              <div>
-                <h2 style={{margin: 0}}>{job.title}</h2>
-                <p style={{color: '#0070f3', fontWeight: 'bold', margin: '5px 0'}}>{job.company}</p>
-                {job.url && <a href={job.url} target="_blank" style={styles.jobLink}>🔗 View Listing</a>}
+          
+          <Link href="/tracker" style={{ textDecoration: 'none', flex: 1 }}>
+            <div style={styles.trackerHeroCard}>
+              <div style={styles.heroHeader}>
+                <div style={styles.pulseContainer}>
+                  <div style={styles.pulseDot}></div>
+                  <span style={styles.heroBadge}>Sync Active</span>
+                </div>
+                <span style={{fontSize: '24px'}}>📈</span>
               </div>
-              <button onClick={() => handleDeleteJob(job.id)} style={styles.btnDelete}>Delete</button>
-            </div>
-
-            <div style={styles.actionRow}>
-              <select 
-                style={styles.select}
-                onChange={(e) => setSelectedResumes(p => ({...p, [job.id]: e.target.value}))}
-                value={selectedResumes[job.id] || ""}
-              >
-                <option value="">-- Choose Resume --</option>
-                {resumes.map(r => <option key={r.id} value={r.id}>{r.name}</option>)}
-              </select>
-              <button 
-                onClick={() => handleAnalyze(job.id)} 
-                style={styles.btnPrimary}
-                disabled={loadingId === job.id}
-              >
-                {loadingId === job.id ? '🔄 Processing...' : 'AI Match'}
-              </button>
-            </div>
-
-            {results[job.id] && (
-              <div style={styles.resultBox}>
-                <div style={styles.score}>Match Score: {results[job.id].match_score}%</div>
-                <div style={styles.summary}>
-                  {/* Safely display summary whether it's an object or string */}
-                  {typeof results[job.id].summary === 'string' 
-                    ? results[job.id].summary 
-                    : JSON.stringify(results[job.id].summary)}
+              <h2 style={styles.heroTitle}>Live Tracker</h2>
+              <div style={styles.statsPreview}>
+                <div style={styles.statMiniCard}>
+                  <span style={styles.statMiniLabel}>Total</span>
+                  <span style={styles.statMiniValue}>{stats.total}</span>
+                </div>
+                <div style={styles.statMiniCard}>
+                  <span style={styles.statMiniLabel}>Today</span>
+                  <span style={styles.statMiniValue}>{stats.today}</span>
                 </div>
               </div>
-            )}
+            </div>
+          </Link>
+        </div>
+
+        <div style={styles.gridMain}>
+          <div style={styles.sidebar}>
+            <section style={styles.glassCard}>
+              <h3 style={styles.cardHeader}>📄 Resume Vault</h3>
+              <form onSubmit={handleResumeUpload} style={styles.form}>
+                <input 
+                  style={styles.input} 
+                  placeholder="Label (e.g. Product Manager v1)" 
+                  value={resumeName} 
+                  onChange={e => setResumeName(e.target.value)} 
+                  required 
+                />
+                <div style={styles.fileUploadWrapper}>
+                  <input 
+                    type="file" 
+                    accept=".pdf" 
+                    onChange={e => setResumeFile(e.target.files[0])} 
+                    required 
+                  />
+                </div>
+                <button type="submit" style={styles.btnIndigo} disabled={isUploading}>
+                  {isUploading ? "Uploading..." : "Add to Vault"}
+                </button>
+              </form>
+              <div style={styles.resumeList}>
+                <div style={{fontSize: '11px', color: '#94a3b8', fontWeight: '700', textTransform: 'uppercase', marginBottom: '5px'}}>Recent Uploads</div>
+                {resumes.slice(0, 3).map(r => (
+                    <div key={r.id} style={styles.resumeItem}>
+                        <span>📄</span> {r.name}
+                    </div>
+                ))}
+                <Link href="/resumes" style={{fontSize: '12px', color: '#6366f1', textDecoration: 'none', marginTop: '10px', fontWeight: '600'}}>
+                    View All {resumes.length} Resumes →
+                </Link>
+              </div>
+            </section>
+
+            <section style={{...styles.glassCard, marginTop: '25px'}}>
+              <h3 style={styles.cardHeader}>➕ Add New Role</h3>
+              <form onSubmit={handleJobSubmit} style={styles.form}>
+                <input style={styles.input} placeholder="Company" value={jobForm.company} onChange={e => setJobForm({...jobForm, company: e.target.value})} required />
+                <input style={styles.input} placeholder="Job Title" value={jobForm.title} onChange={e => setJobForm({...jobForm, title: e.target.value})} required />
+                <input style={styles.input} placeholder="LinkedIn/Indeed URL" value={jobForm.url} onChange={e => setJobForm({...jobForm, url: e.target.value})} />
+                <button type="submit" style={styles.btnSlate} disabled={isScraping}>
+                  {isScraping ? "Scraping..." : "Process Job"}
+                </button>
+              </form>
+            </section>
           </div>
-        ))}
+
+          <div style={styles.mainFeed}>
+            <h3 style={{...styles.cardHeader, paddingLeft: '10px'}}>🎯 Analysis Pipeline</h3>
+            <div style={styles.feedScroll}>
+              {jobs.filter(j => !j.gmail_id).length === 0 && (
+                  <div style={{textAlign: 'center', padding: '40px', color: '#94a3b8'}}>
+                      No jobs added yet. Use the "Add New Role" form to start.
+                  </div>
+              )}
+              {jobs.filter(j => !j.gmail_id).map(job => (
+                <div key={job.id} style={styles.feedCard}>
+                  <div style={styles.cardInfo}>
+                    <h4 style={styles.jobTitle}>{job.title}</h4>
+                    <p style={styles.jobCompany}>{job.company}</p>
+                  </div>
+                  <div style={styles.actionRow}>
+                    <select 
+                        style={styles.modernSelect} 
+                        onChange={(e) => setSelectedResumes(p => ({...p, [job.id]: e.target.value}))} 
+                        value={selectedResumes[job.id] || ""}
+                    >
+                      <option value="">Select Resume</option>
+                      {resumes.map(r => <option key={r.id} value={r.id}>{r.name}</option>)}
+                    </select>
+                    <button 
+                        onClick={() => handleAnalyze(job.id)} 
+                        style={styles.btnAnalyze} 
+                        disabled={loadingId === job.id}
+                    >
+                      {loadingId === job.id ? '...' : 'AI Analyze'}
+                    </button>
+                  </div>
+                  {results[job.id] && (
+                    <div style={styles.scoreBadge}>
+                      Match Score: <span style={{fontWeight: '800'}}>{results[job.id].match_score}%</span>
+                    </div>
+                  )}
+                </div>
+              ))}
+            </div>
+          </div>
+        </div>
       </div>
     </div>
   );
 }
 
-// --- STYLES ---
+// ... styles remain the same as your provided code ...
 const styles = {
-  container: { maxWidth: '1100px', margin: '0 auto', padding: '40px 20px', fontFamily: 'system-ui, sans-serif', backgroundColor: '#f9f9f9', minHeight: '100vh' },
-  header: { textAlign: 'center', marginBottom: '40px' },
-  gridSplit: { display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(350px, 1fr))', gap: '25px' },
-  section: { background: '#fff', padding: '25px', borderRadius: '15px', border: '1px solid #eee' },
-  form: { display: 'flex', flexDirection: 'column', gap: '12px' },
-  input: { padding: '12px', borderRadius: '8px', border: '1px solid #ddd', fontSize: '14px' },
-  btnPrimary: { padding: '12px', background: '#0070f3', color: '#fff', border: 'none', borderRadius: '8px', cursor: 'pointer', fontWeight: 'bold' },
-  btnSecondary: { padding: '12px', background: '#111', color: '#fff', border: 'none', borderRadius: '8px', cursor: 'pointer', fontWeight: 'bold' },
-  tagList: { marginTop: '15px', display: 'flex', flexWrap: 'wrap', gap: '8px' },
-  tag: { fontSize: '12px', padding: '5px 10px', background: '#f0f0f0', border: '1px solid #ddd', borderRadius: '5px' },
-  divider: { margin: '40px 0', border: 'none', borderTop: '1px solid #eee' },
-  feed: { display: 'grid', gap: '25px' },
-  card: { background: '#fff', padding: '30px', borderRadius: '20px', border: '1px solid #eee', boxShadow: '0 2px 8px rgba(0,0,0,0.05)' },
-  cardHeader: { display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start' },
-  jobLink: { fontSize: '13px', color: '#0070f3', textDecoration: 'none' },
-  btnDelete: { background: 'none', border: 'none', color: '#ff4d4f', cursor: 'pointer', fontSize: '13px' },
-  actionRow: { display: 'flex', gap: '15px', marginTop: '20px', padding: '15px', background: '#f8f9fa', borderRadius: '10px' },
-  select: { flex: 1, padding: '10px', borderRadius: '8px', border: '1px solid #ddd' },
-  resultBox: { marginTop: '20px', padding: '20px', background: '#e6f3ff', borderRadius: '10px', borderLeft: '5px solid #0070f3' },
-  score: { fontWeight: 'bold', fontSize: '18px', color: '#0070f3', marginBottom: '10px' },
-  summary: { fontSize: '14px', lineHeight: '1.5', color: '#444' }
-};
+    container: { backgroundColor: '#f8fafc', minHeight: '100vh', fontFamily: 'Inter, system-ui, sans-serif', color: '#1e293b' },
+    navbar: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '15px 60px', backgroundColor: '#fff', borderBottom: '1px solid #e2e8f0', position: 'sticky', top: 0, zIndex: 100 },
+    navBrand: { fontSize: '22px', fontWeight: '800', letterSpacing: '-0.5px' },
+    navLinks: { display: 'flex', alignItems: 'center', gap: '25px' },
+    navItem: { textDecoration: 'none', color: '#64748b', fontWeight: '600', fontSize: '14px' },
+    userCircle: { width: '35px', height: '35px', backgroundColor: '#6366f1', color: '#fff', borderRadius: '50%', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: '12px', fontWeight: 'bold' },
+    
+    contentWrapper: { maxWidth: '1200px', margin: '0 auto', padding: '40px 20px' },
+    heroSection: { display: 'flex', alignItems: 'center', gap: '40px', marginBottom: '50px' },
+    heroText: { flex: 1.5 },
+    mainTitle: { fontSize: '52px', fontWeight: '900', letterSpacing: '-2px', lineHeight: 1.1, margin: 0 },
+    gradientText: { background: 'linear-gradient(90deg, #6366f1, #a855f7)', WebkitBackgroundClip: 'text', WebkitTextFillColor: 'transparent' },
+    subtitle: { fontSize: '18px', color: '#64748b', marginTop: '15px' },
+    
+    trackerHeroCard: { background: '#1e293b', color: '#fff', padding: '30px', borderRadius: '24px', boxShadow: '0 20px 25px -5px rgba(0,0,0,0.1)', transition: 'transform 0.2s' },
+    heroHeader: { display: 'flex', justifyContent: 'space-between', marginBottom: '20px' },
+    pulseContainer: { display: 'flex', alignItems: 'center', gap: '8px' },
+    pulseDot: { width: '8px', height: '8px', backgroundColor: '#22c55e', borderRadius: '50%', animation: 'pulse 2s infinite' },
+    heroBadge: { fontSize: '10px', fontWeight: '800', textTransform: 'uppercase', color: '#22c55e' },
+    heroTitle: { fontSize: '24px', fontWeight: '700', marginBottom: '20px' },
+    statsPreview: { display: 'flex', gap: '15px' },
+    statMiniCard: { flex: 1, backgroundColor: 'rgba(255,255,255,0.05)', padding: '12px', borderRadius: '14px', border: '1px solid rgba(255,255,255,0.1)' },
+    statMiniLabel: { fontSize: '10px', color: '#94a3b8', display: 'block', marginBottom: '4px' },
+    statMiniValue: { fontSize: '20px', fontWeight: '700' },
+  
+    gridMain: { display: 'grid', gridTemplateColumns: '380px 1fr', gap: '30px' },
+    sidebar: { display: 'flex', flexDirection: 'column' },
+    glassCard: { background: '#fff', padding: '25px', borderRadius: '20px', border: '1px solid #e2e8f0', boxShadow: '0 1px 3px rgba(0,0,0,0.05)' },
+    cardHeader: { fontSize: '18px', fontWeight: '700', margin: '0 0 20px 0', color: '#334155' },
+    form: { display: 'flex', flexDirection: 'column', gap: '12px' },
+    input: { padding: '12px', borderRadius: '10px', border: '1px solid #cbd5e1', fontSize: '14px' },
+    btnIndigo: { padding: '12px', backgroundColor: '#6366f1', color: '#fff', border: 'none', borderRadius: '10px', fontWeight: '700', cursor: 'pointer' },
+    btnSlate: { padding: '12px', backgroundColor: '#334155', color: '#fff', border: 'none', borderRadius: '10px', fontWeight: '700', cursor: 'pointer' },
+    resumeList: { marginTop: '20px', display: 'flex', flexDirection: 'column', gap: '8px' },
+    resumeItem: { fontSize: '13px', color: '#64748b', padding: '8px', background: '#f8fafc', borderRadius: '6px' },
+  
+    mainFeed: { display: 'flex', flexDirection: 'column' },
+    feedScroll: { display: 'grid', gap: '15px' },
+    feedCard: { background: '#fff', padding: '20px', borderRadius: '20px', border: '1px solid #e2e8f0', display: 'flex', alignItems: 'center', justifyContent: 'space-between' },
+    cardInfo: { flex: 1 },
+    jobTitle: { fontSize: '17px', fontWeight: '700', margin: 0 },
+    jobCompany: { fontSize: '14px', color: '#6366f1', fontWeight: '600', margin: '2px 0 0 0' },
+    actionRow: { display: 'flex', gap: '10px', alignItems: 'center' },
+    modernSelect: { padding: '10px', borderRadius: '10px', border: '1px solid #cbd5e1', fontSize: '13px', backgroundColor: '#fff' },
+    btnAnalyze: { padding: '10px 15px', backgroundColor: '#f1f5f9', border: '1px solid #e2e8f0', borderRadius: '10px', fontWeight: '700', fontSize: '13px', cursor: 'pointer' },
+    scoreBadge: { marginLeft: '20px', padding: '8px 12px', background: '#f0f9ff', color: '#0369a1', borderRadius: '10px', fontSize: '13px', border: '1px solid #bae6fd' }
+  };

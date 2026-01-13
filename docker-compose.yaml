@@ -53,24 +53,31 @@ services:
       - NEXT_PUBLIC_API_URL=http://localhost:8000
     depends_on:
       - gateway
+    networks:
+      - careerflow-network    
+
 
   gmail-agent:
-    build:
-      context: ./services/agents         
-      # dockerfile: Dockerfile
-    # depends_on:
-    #   db:
-    #     condition: service_healthy
-    #   ai-engine:
-    #     condition: any
+    build: ./services/agents
+    command: python gmail-agent.py
     environment:
-      - DATABASE_URL=postgresql://postgres:password@db:5432/careerflow_db
-      - AI_ENGINE_URL=http://ai-engine:8000/process
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
     volumes:
-      - ./services/agents/token.json:/app/token.json
-    networks:
-      - careerflow-network
+      - ./services/agents:/app
+    depends_on:
+      - gateway
 
+  report-worker:
+    build: ./services/agents
+    command: python report-worker.py
+    environment:
+      - TZ=America/Chicago  # <--- THIS IS THE CRITICAL LINE
+    volumes:
+      - ./services/agents:/app
+      - /etc/localtime:/etc/localtime:ro # Optional: Mounts host time to container
+    depends_on:
+      - gateway
+      
 volumes:
   postgres_data:
 

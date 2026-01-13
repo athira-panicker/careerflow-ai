@@ -18,3 +18,10 @@ SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
 DRY_RUN_MODE = os.getenv("DRY_RUN", "True").lower() == "true"
+
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()

@@ -19,7 +19,18 @@ class Resume(Base):
     __tablename__ = "resumes"
     id = Column(Integer, primary_key=True, index=True)
     name = Column(String)
-    content = Column(Text)
+    content = Column(Text) 
+    file_url = Column(String)
+
+class TrackerJob(Base):
+    __tablename__ = "application_tracker"
+    id = Column(Integer, primary_key=True, index=True)
+    gmail_id = Column(String, unique=True, index=True)
+    company = Column(String)
+    role = Column(String)
+    status = Column(String)
+    required_skills = Column(String)
+    applied_at = Column(DateTime, default=func.now())
 
 class AnalysisResult(Base):
     __tablename__ = "analysis_results"
